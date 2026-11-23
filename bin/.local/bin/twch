@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+twitch_vlc.py - extract the HLS (m3u8) stream URL of a live Twitch channel,
+let you pick a quality and a video player (VLC, mpv, ...), and play it.
+
+Usage:
+    python twitch_vlc.py twitch.tv/username                 # menus for quality + player
+    python twitch_vlc.py https://www.twitch.tv/username -q 720p60 -p mpv
+    python twitch_vlc.py username -p "C:\\Tools\\smplayer.exe"   # any other player
+    python twitch_vlc.py username -p mpv -q 720p --save     # remember these choices
+    python twitch_vlc.py username                           # uses saved choices
+    python twitch_vlc.py username --print                   # just print the m3u8 URL
+    python twitch_vlc.py --show-config                      # where the config lives
+
+The script waits until the player closes, then exits with the player's exit code.
+
+Only needs the Python 3 standard library + at least one video player installed.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# Public web-player client ID (the same one twitch.tv itself uses).
+CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+GQL_URL = "https://gql.twitch.tv/gql"
+USHER_URL = "https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+GQL_QUERY = """
+query PlaybackAccessToken_Template($login: String!, $playerType: String!) {
+  streamPlaybackAccessToken(
+    channelName: $login,
+    params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}
+  ) {
+    value
+    signature
+  }
+}
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def parse_channel(text: str) -> str:
+    """Accept 'twitch.tv/name', full URLs, or a bare username."""
+    text = text.strip()
+    m = re.search(r"twitch\.tv/([A-Za-z0-9_]{2,25})", text)
+    if m:
+        return m.group(1).lower()
+    if re.fullmatch(r"[A-Za-z0-9_]{2,25}", text):
+        return text.lower()
+    sys.exit(f"Could not parse a Twitch channel name from: {text!r}")
+
+
+def http(url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, headers=headers or {})
+    req.add_header("User-Agent", USER_AGENT)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def get_access_token(channel: str):
+    payload = json.dumps(
+        {
+            "operationName": "PlaybackAccessToken_Template",
+            "query": GQL_QUERY,
+            "variables": {"login": channel, "playerType": "site"},
+        }
+    ).encode()
+    body = http(
+        GQL_URL,
+        data=payload,
+        headers={"Client-ID": CLIENT_ID, "Content-Type": "application/json"},
+    )
+    data = json.loads(body)
+    token = (data.get("data") or {}).get("streamPlaybackAccessToken")
+    if not token:
+        sys.exit(f"Twitch returned no access token for '{channel}' "
+                 f"(does the channel exist?). Response: {body[:200]}")
+    return token["value"], token["signature"]
+
+
+def get_master_playlist(channel: str) -> str:
+    token, sig = get_access_token(channel)
+    params = {
+        "sig": sig,
+        "token": token,
+        "allow_source": "true",
+        "allow_audio_only": "true",
+        "fast_bread": "true",
+        "player": "twitchweb",
+        "playlist_include_framerate": "true",
+        "p": random.randint(100000, 999999),
+    }
+    url = USHER_URL.format(channel=channel) + "?" + urllib.parse.urlencode(params)
+    try:
+        return http(url), url
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            sys.exit(f"'{channel}' appears to be offline (or doesn't exist).")
+        sys.exit(f"HTTP {e.code} while fetching the playlist: {e.reason}")
+
+
+ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+
+
+def parse_attrs(line: str) -> dict:
+    return {k: v.strip('"') for k, v in ATTR_RE.findall(line)}
+
+
+def parse_master(playlist: str):
+    """Return a list of dicts: {name, resolution, bandwidth, url}."""
+    names = {}      # GROUP-ID -> human readable NAME (e.g. '1080p60 (source)')
+    variants = []
+    lines = playlist.splitlines()
+
+    for line in lines:
+        if line.startswith("#EXT-X-MEDIA:"):
+            a = parse_attrs(line)
+            if "GROUP-ID" in a and "NAME" in a:
+                names[a["GROUP-ID"]] = a["NAME"]
+
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            a = parse_attrs(line)
+            url = next((l for l in lines[i + 1:] if l and not l.startswith("#")), None)
+            if not url:
+                continue
+            group = a.get("VIDEO", "")
+            variants.append(
+                {
+                    "name": names.get(group, group or "unknown"),
+                    "resolution": a.get("RESOLUTION", ""),
+                    "bandwidth": int(a.get("BANDWIDTH", "0") or 0),
+                    "url": url,
+                }
+            )
+    return variants
+
+
+def config_path() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "twitch_vlc", "config.json")
+
+
+def load_config() -> dict:
+    path = config_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError) as e:
+        print(f"Warning: could not read config {path}: {e}\n")
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"Saved preferences to {path}")
+
+
+def as_list(value) -> list:
+    if not value:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def match_quality(variants, wanted: str):
+    w = wanted.strip().lower()
+    if w in ("best", "source"):
+        return max(variants, key=lambda v: v["bandwidth"])
+    if w == "worst":
+        return min(variants, key=lambda v: v["bandwidth"])
+    for v in variants:  # variants are sorted best-first, so '720p' -> '720p60'
+        if v["name"].lower().startswith(w):
+            return v
+    return None
+
+
+def choose_quality(variants, preferences=None):
+    """preferences: ordered list of wanted qualities; first one that exists wins."""
+    for wanted in preferences or []:
+        v = match_quality(variants, wanted)
+        if v:
+            return v
+    if preferences:
+        print(f"None of the preferred qualities ({', '.join(preferences)}) "
+              f"are available, falling back to menu.\n")
+
+    print("Available qualities:")
+    for idx, v in enumerate(variants, 1):
+        res = f" [{v['resolution']}]" if v["resolution"] else ""
+        print(f"  {idx:>2}) {v['name']}{res}  ~{v['bandwidth'] / 1_000_000:.1f} Mbps")
+    while True:
+        raw = input(f"Choose 1-{len(variants)} (Enter = 1): ").strip()
+        if raw == "":
+            return variants[0]
+        if raw.isdigit() and 1 <= int(raw) <= len(variants):
+            return variants[int(raw) - 1]
+        print("Invalid choice.")
+
+
+# Known players: PATH names, common install paths, and how to pass a window title.
+PLAYERS = {
+    "vlc": {
+        "label": "VLC",
+        "names": ["vlc"],
+        "paths": [
+            r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+            r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+            "/Applications/VLC.app/Contents/MacOS/VLC",
+            "/usr/bin/vlc",
+            "/snap/bin/vlc",
+            "/var/lib/flatpak/exports/bin/org.videolan.VLC",
+        ],
+        "base_args": ["--no-one-instance"],
+        "title": lambda t: [f"--meta-title={t}"],
+    },
+    "mpv": {
+        "label": "mpv",
+        "names": ["mpv"],
+        "paths": [
+            r"C:\Program Files\mpv\mpv.exe",
+            os.path.expanduser(r"~\scoop\apps\mpv\current\mpv.exe"),
+            "/opt/homebrew/bin/mpv",
+            "/usr/local/bin/mpv",
+            "/usr/bin/mpv",
+            "/snap/bin/mpv",
+        ],
+        "title": lambda t: [f"--force-media-title={t}"],
+    },
+    "mplayer": {
+        "label": "MPlayer",
+        "names": ["mplayer"],
+        "paths": ["/usr/bin/mplayer", "/usr/local/bin/mplayer"],
+        "title": lambda t: ["-title", t],
+    },
+    "ffplay": {
+        "label": "ffplay (FFmpeg)",
+        "names": ["ffplay"],
+        "paths": ["/usr/bin/ffplay", "/usr/local/bin/ffplay", "/opt/homebrew/bin/ffplay"],
+        "title": lambda t: ["-window_title", t],
+    },
+    "potplayer": {
+        "label": "PotPlayer",
+        "names": ["PotPlayerMini64", "PotPlayerMini"],
+        "paths": [
+            r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
+            r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe",
+        ],
+        "title": lambda t: [],
+    },
+    "iina": {
+        "label": "IINA",
+        "names": ["iina-cli", "iina"],
+        "paths": ["/Applications/IINA.app/Contents/MacOS/iina-cli"],
+        "title": lambda t: [],
+    },
+}
+
+
+def find_player_exe(key):
+    spec = PLAYERS[key]
+    for name in spec["names"]:
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    for p in spec["paths"]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def detect_players():
+    """Return [(key, exe_path), ...] for every known player that is installed."""
+    found = []
+    for key in PLAYERS:
+        exe = find_player_exe(key)
+        if exe:
+            found.append((key, exe))
+    return found
+
+
+def resolve_player(arg, fatal=True):
+    """A known name (vlc, mpv, ...) or a path/command. Returns (key, exe).
+
+    With fatal=False, returns None (after a warning) instead of exiting.
+    """
+    def fail(msg):
+        if fatal:
+            sys.exit(msg)
+        print(f"Warning: {msg}\n")
+        return None
+
+    key = arg.lower()
+    if key in PLAYERS:
+        exe = find_player_exe(key)
+        if not exe:
+            return fail(f"{PLAYERS[key]['label']} not found. Install it or use "
+                        f"--player /full/path/to/executable")
+        return key, exe
+    exe = shutil.which(arg) or (arg if os.path.exists(arg) else None)
+    if not exe:
+        return fail(f"Player '{arg}' not found (known: {', '.join(PLAYERS)}; "
+                    f"or give a full path).")
+    # Custom path: still use known title flags if the filename matches a known player.
+    base = os.path.splitext(os.path.basename(exe))[0].lower()
+    return (base if base in PLAYERS else None), exe
+
+
+def choose_player():
+    found = detect_players()
+    print("Video players:")
+    for idx, (key, exe) in enumerate(found, 1):
+        print(f"  {idx}) {PLAYERS[key]['label']}  ({exe})")
+    custom_idx = len(found) + 1
+    print(f"  {custom_idx}) Other (enter a path or command)")
+    while True:
+        raw = input(f"Choose 1-{custom_idx} (Enter = 1): ").strip() or "1"
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(found):
+                return found[n - 1]
+            if n == custom_idx:
+                path = input("Player path or command: ").strip().strip('"')
+                if path:
+                    resolved = resolve_player(path, fatal=False)
+                    if resolved:
+                        return resolved
+        print("Invalid choice.")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def run_player(cmd, verbose=False):
+    """Launch the player and block until it exits. Returns its exit code."""
+    out = None if verbose else subprocess.DEVNULL
+    started = time.monotonic()
+    proc = subprocess.Popen(cmd, stdout=out, stderr=out)
+    try:
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        print("\nInterrupted, closing the player...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return 130
+    if rc == 0 and time.monotonic() - started < 2:
+        print("Note: the player exited almost immediately. It may have handed the "
+              "stream to an already-running instance (or a launcher wrapper).")
+    return rc
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Open a Twitch live stream in the video player of your choice.")
+    ap.add_argument("channel", nargs="?",
+                    help="twitch.tv/username, full URL, or username")
+    ap.add_argument("-q", "--quality",
+                    help="e.g. 720p60, 480p, audio_only, best, worst "
+                         "(overrides the saved preference)")
+    ap.add_argument("-p", "--player",
+                    help=f"{', '.join(PLAYERS)}, or a path/command to any player "
+                         "(overrides the saved preference)")
+    ap.add_argument("--save", action="store_true",
+                    help="save the player and quality used in this run as defaults")
+    ap.add_argument("--no-config", action="store_true",
+                    help="ignore the saved config for this run (always show menus)")
+    ap.add_argument("--show-config", action="store_true",
+                    help="print the config file location and contents, then exit")
+    ap.add_argument("--verbose", action="store_true",
+                    help="show the player's own console output")
+    ap.add_argument("--print", dest="print_only", action="store_true",
+                    help="print the m3u8 URL instead of launching a player")
+    args = ap.parse_args()
+
+    if args.show_config:
+        path = config_path()
+        print(f"Config file: {path}")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                print(f.read())
+        else:
+            print("(none yet - run with --save to create one)")
+        return
+    if not args.channel:
+        ap.error("the following arguments are required: channel")
+
+    cfg = {} if args.no_config else load_config()
+
+    channel = parse_channel(args.channel)
+    print(f"Channel: {channel}")
+
+    playlist, _ = get_master_playlist(channel)
+    variants = parse_master(playlist)
+    if not variants:
+        sys.exit("No stream variants found in the playlist.")
+
+    # Best quality first
+    variants.sort(key=lambda v: v["bandwidth"], reverse=True)
+    quality_prefs = [args.quality] if args.quality else as_list(cfg.get("quality"))
+    choice = choose_quality(variants, quality_prefs)
+    print(f"\nSelected: {choice['name']}")
+    print(f"m3u8 URL: {choice['url']}\n")
+
+    if args.print_only:
+        return
+
+    # Player: CLI flag > saved config > interactive menu
+    resolved = None
+    if args.player:
+        resolved = resolve_player(args.player)
+    elif cfg.get("player"):
+        resolved = resolve_player(cfg["player"], fatal=False)
+    if not resolved:
+        resolved = choose_player()
+    key, exe = resolved
+
+    if args.save:
+        cfg["player"] = key or exe
+        cfg["quality"] = ["source" if "(source)" in choice["name"].lower()
+                          else choice["name"]]
+        save_config(cfg)
+
+    # Extra per-player flags from the config, e.g.
+    #   "player_args": {"mpv": ["--profile=low-latency"], "vlc": "--network-caching=1000"}
+    extra = cfg.get("player_args", {}).get(key or "", [])
+    extra = shlex.split(extra) if isinstance(extra, str) else list(extra)
+
+    title = f"{channel} - {choice['name']}"
+    spec = PLAYERS.get(key) if key else None
+    base_args = spec.get("base_args", []) if spec else []
+    title_args = spec["title"](title) if spec else []
+    label = spec["label"] if spec else exe
+
+    cmd = [exe, choice["url"], *base_args, *title_args, *extra]
+    print(f"Launching {label}: {exe}")
+    print("Playing... close the player (or press Ctrl+C here) to exit.")
+    rc = run_player(cmd, verbose=args.verbose)
+    print(f"Player exited (code {rc}).")
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

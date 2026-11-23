@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# resticmgr.sh - interactively manage which directories restic backs up.
+#
+# Interactive:      ./resticmgr.sh
+# Non-interactive:  ./resticmgr.sh backup     (works from cron / systemd timers)
+#                   ./resticmgr.sh browse   (look inside the repo without restoring)
+#                   ./resticmgr.sh ls [snapshot] [dir] | find <pattern> | diff <old> [new]
+#                   ./resticmgr.sh dump <snapshot> <path> [save-to] | summary | mount [dir]
+#                   ./resticmgr.sh zip      (re-create the upload zip only)
+#                   ./resticmgr.sh restore [snapshot] [target] [path-in-snapshot]
+#                   ./resticmgr.sh list | add | remove | init | snapshots | check
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/resticmgr"
+DIRS_FILE="$CONFIG_DIR/dirs.txt"
+CONF_FILE="$CONFIG_DIR/config"
+
+mkdir -p "$CONFIG_DIR"
+touch "$DIRS_FILE"
+
+# ---- defaults (overridden by the config file) -------------------------------
+REPO=""                   # asked for on first run, then stored in the config file
+ZIP_PATH=""               # where to write the upload zip after each backup ('' = ask once)
+PASSWORD_FILE=""          # optional: path to a file containing the repo password
+TAG="personal"
+
+# shellcheck disable=SC1090
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+command -v restic >/dev/null || { echo "restic is not installed." >&2; exit 1; }
+
+# ---- helpers ----------------------------------------------------------------
+say()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+ok()   { printf '\033[1;32mOK\033[0m %s\n' "$*"; }
+
+pause() { [[ -t 0 ]] && { read -r -p $'\nPress Enter to continue...' _; } || true; }
+
+repo_exists() { restic cat config >/dev/null 2>&1; }
+
+save_config() {
+  {
+    printf 'REPO=%q\n' "$REPO"
+    printf 'ZIP_PATH=%q\n' "$ZIP_PATH"
+    printf 'PASSWORD_FILE=%q\n' "$PASSWORD_FILE"
+    printf 'TAG=%q\n' "$TAG"
+  } > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+}
+
+apply_env() {
+  export RESTIC_REPOSITORY="$REPO"
+  if [[ -n "$PASSWORD_FILE" ]]; then export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+  else unset RESTIC_PASSWORD_FILE; fi
+}
+
+# Ask for the repository location if none is stored yet.
+ensure_repo() {
+  if [[ -z "$REPO" ]]; then
+    if [[ ! -t 0 ]]; then
+      echo "No repository configured. Run $0 interactively once to set it." >&2
+      exit 1
+    fi
+    say "First run: where is (or should be) your restic repository?"
+    local v
+    while [[ -z "${v:-}" ]]; do
+      read -e -r -p "Repository path: " v
+    done
+    REPO="$(realpath -m "${v/#\~/$HOME}")"
+    save_config
+    ok "Saved to $CONF_FILE"
+  fi
+  apply_env
+}
+
+# ---- actions ----------------------------------------------------------------
+list_dirs() {
+  say "Directories to back up"
+  if [[ ! -s "$DIRS_FILE" ]]; then
+    echo "  (none yet)"
+    return
+  fi
+  local i=1 line
+  while IFS= read -r line; do
+    if [[ -e "$line" ]]; then
+      printf '  %2d) %s\n' "$i" "$line"
+    else
+      printf '  %2d) %s  \033[1;31m[missing]\033[0m\n' "$i" "$line"
+    fi
+    ((i++))
+  done < "$DIRS_FILE"
+}
+
+add_dirs() {
+  say "Add directories (Tab completes paths, empty line to finish)"
+  local input path
+  while true; do
+    read -e -r -p "Directory: " input
+    [[ -z "$input" ]] && break
+
+    input="${input/#\~/$HOME}"            # expand leading ~
+    if [[ ! -d "$input" ]]; then
+      warn "Not a directory: $input"
+      continue
+    fi
+    path="$(realpath "$input")"
+
+    if grep -Fxq -- "$path" "$DIRS_FILE"; then
+      warn "Already in the list: $path"
+    else
+      echo "$path" >> "$DIRS_FILE"
+      ok "Added $path"
+    fi
+  done
+}
+
+remove_dirs() {
+  [[ -s "$DIRS_FILE" ]] || { warn "Nothing to remove."; return; }
+  list_dirs
+  local n total
+  total=$(wc -l < "$DIRS_FILE")
+  read -r -p $'\nNumber to remove (empty to cancel): ' n
+  [[ -z "$n" ]] && return
+  if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= total )); then
+    sed -i "${n}d" "$DIRS_FILE"
+    ok "Removed entry $n"
+  else
+    warn "Invalid number."
+  fi
+}
+
+init_repo() {
+  if repo_exists; then
+    ok "Repository already exists at $REPO"
+    return
+  fi
+  say "Initializing repository at $REPO"
+  mkdir -p "$(dirname "$REPO")"
+  restic init
+}
+
+# Zip the (already encrypted) repo into one file for uploading.
+make_zip() {
+  if [[ ! -d "$REPO" ]]; then
+    warn "Repo is not a local directory ($REPO); skipping zip."
+    return 0
+  fi
+  command -v zip >/dev/null || { warn "'zip' is not installed; skipping zip."; return 1; }
+
+  if [[ -z "$ZIP_PATH" ]]; then
+    if [[ -t 0 ]]; then
+      local v
+      read -e -r -p "Where should the zip be written? [${REPO%/}.zip] (- to disable): " v
+      v="${v:-${REPO%/}.zip}"
+      if [[ "$v" == "-" ]]; then ZIP_PATH="-"; else ZIP_PATH="$(realpath -m "${v/#\~/$HOME}")"; fi
+      save_config
+    else
+      warn "No zip path configured; skipping zip. Run interactively once to set it."
+      return 0
+    fi
+  fi
+  [[ "$ZIP_PATH" == "-" ]] && return 0
+
+  local repo_abs zip_abs tmp_zip
+  repo_abs="$(realpath "$REPO")"
+  zip_abs="$(realpath -m "$ZIP_PATH")"
+  case "$zip_abs" in
+    "$repo_abs"/*) warn "Zip path is inside the repo; choose another location (Settings)."; return 1 ;;
+  esac
+
+  say "Creating zip: $zip_abs"
+  mkdir -p "$(dirname "$zip_abs")"
+  tmp_zip="$(mktemp "${zip_abs}.XXXXXX")"
+  rm -f "$tmp_zip"                       # zip wants to create the file itself
+  tmp_zip="${tmp_zip}.zip"
+
+  # -0 = store only: restic data is already compressed + encrypted.
+  if ! ( cd "$(dirname "$repo_abs")" && zip -r -0 -q "$tmp_zip" "$(basename "$repo_abs")" ); then
+    rm -f "$tmp_zip"; warn "zip failed."; return 1
+  fi
+  if ! zip -T -q "$tmp_zip" >/dev/null 2>&1; then
+    rm -f "$tmp_zip"; warn "Zip integrity test failed."; return 1
+  fi
+
+  mv -f "$tmp_zip" "$zip_abs"            # replace the old zip only once the new one is good
+  ( cd "$(dirname "$zip_abs")" && sha256sum "$(basename "$zip_abs")" > "$(basename "$zip_abs").sha256" )
+  ok "Zip ready: $zip_abs ($(du -h "$zip_abs" | cut -f1)), checksum in ${zip_abs}.sha256"
+}
+
+run_backup() {
+  if [[ ! -s "$DIRS_FILE" ]]; then
+    warn "No directories configured. Use 'add' first."
+    return 1
+  fi
+
+  if ! repo_exists; then
+    warn "No repository found at $REPO"
+    if [[ -t 0 ]]; then
+      read -r -p "Initialize it now? [y/N] " a
+      [[ "$a" =~ ^[Yy]$ ]] && init_repo || return 1
+    else
+      return 1
+    fi
+  fi
+
+  # Drop entries that no longer exist so one bad path doesn't kill the run.
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  while IFS= read -r line; do
+    if [[ -e "$line" ]]; then
+      echo "$line" >> "$tmp"
+    else
+      warn "Skipping missing path: $line"
+    fi
+  done < "$DIRS_FILE"
+
+  [[ -s "$tmp" ]] || { warn "No existing paths to back up."; return 1; }
+
+  say "Backing up"
+  restic backup --files-from "$tmp" --tag "$TAG" --verbose || { warn "Backup failed; zip not created."; return 1; }
+  make_zip
+}
+
+restore_snapshot() {
+  # usage: restore_snapshot [snapshot] [target] [path-inside-snapshot]
+  local id="${1:-}" target="${2:-}" inc="${3:-}" a ts args
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+
+  if [[ -z "$id" ]]; then
+    [[ -t 0 ]] || { warn "Non-interactive restore needs: restore <snapshot> <target> [path]"; return 1; }
+    say "Snapshots"
+    restic snapshots --compact
+    read -r -p $'\nSnapshot ID [latest]: ' id
+    id="${id:-latest}"
+
+    read -r -p "Browse files in this snapshot first? [y/N] " a
+    if [[ "$a" =~ ^[Yy]$ ]]; then
+      restic ls "$id" | "${PAGER:-less}" || true
+    fi
+    read -e -r -p "Path inside snapshot to restore (empty = everything): " inc
+  fi
+
+  if [[ -z "$target" ]]; then
+    ts="$(date +%Y%m%d-%H%M%S)"
+    read -e -r -p "Restore into [$HOME/restore-$ts]: " target
+    target="${target:-$HOME/restore-$ts}"
+  fi
+  target="$(realpath -m "${target/#\~/$HOME}")"
+
+  # Safety: restoring to / would overwrite the live originals.
+  if [[ "$target" == "/" ]]; then
+    warn "Target is / : this overwrites the original files in place."
+    read -r -p "Type OVERWRITE to continue: " a
+    [[ "$a" == "OVERWRITE" ]] || { echo "Cancelled."; return 1; }
+  elif [[ -d "$target" && -n "$(ls -A "$target" 2>/dev/null)" ]]; then
+    warn "Target is not empty: $target (existing files may be overwritten)"
+    read -r -p "Continue? [y/N] " a
+    [[ "$a" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 1; }
+  fi
+
+  mkdir -p "$target"
+  args=(restore "$id" --target "$target" --verify)
+  [[ -n "$inc" ]] && args+=(--include "$inc")
+
+  say "Restoring '$id'${inc:+ (only $inc)} into $target"
+  restic "${args[@]}"
+  ok "Restored to $target"
+}
+
+# ---- browsing (read-only, nothing is restored) -----------------------------
+page() {                                  # pipe into a pager when on a terminal
+  if [[ -t 1 ]]; then
+    local p="${PAGER:-less -FRX}"
+    $p || true
+  else
+    cat
+  fi
+}
+
+ask_snapshot() { local id; read -r -p "$1 [latest]: " id; echo "${id:-latest}"; }
+
+repo_summary() {
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  say "Snapshots"
+  restic snapshots --compact
+  say "Size of the latest snapshot (as restored)"
+  restic stats latest
+  say "Repository size on disk (deduplicated + compressed)"
+  restic stats --mode raw-data
+}
+
+# list_files [snapshot] [dir-inside-snapshot]
+list_files() {
+  local id="${1:-}" sub="${2:-}" rec="" a args
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  if [[ -z "$id" ]]; then
+    [[ -t 0 ]] || { warn "Usage: ls <snapshot> [dir]"; return 1; }
+    say "Snapshots"
+    restic snapshots --compact
+    id="$(ask_snapshot "Snapshot ID")"
+    read -e -r -p "Directory inside snapshot (empty = whole snapshot): " sub
+    if [[ -n "$sub" ]]; then
+      read -r -p "Include subdirectories? [y/N] " a
+      [[ "$a" =~ ^[Yy]$ ]] && rec="--recursive"
+    fi
+  fi
+  sub="${sub/#\~/$HOME}"
+  args=(ls --long "$id")
+  [[ -n "$sub" ]] && args+=("$sub")
+  [[ -n "$rec" ]] && args+=("$rec")
+  restic "${args[@]}" | page || true
+}
+
+# find_files [pattern]  - search every snapshot by file name
+find_files() {
+  local pat="${1:-}"
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  if [[ -z "$pat" ]]; then
+    read -r -p "File name or pattern (e.g. kdbx, *.pdf): " pat
+  fi
+  [[ -n "$pat" ]] || return 0
+  [[ "$pat" == *[*?[]* ]] || pat="*$pat*"      # plain word -> substring match
+  restic find --ignore-case "$pat" | page || true
+}
+
+# diff_snapshots [older] [newer]
+diff_snapshots() {
+  local a="${1:-}" b="${2:-}"
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  if [[ -z "$a" ]]; then
+    [[ -t 0 ]] || { warn "Usage: diff <older> [newer]"; return 1; }
+    say "Snapshots"
+    restic snapshots --compact
+    read -r -p "Older snapshot ID: " a
+    [[ -n "$a" ]] || return 0
+    b="$(ask_snapshot "Newer snapshot ID")"
+  fi
+  restic diff "$a" "${b:-latest}" | page || true
+}
+
+# dump_file [snapshot] [path-in-snapshot] [save-to]
+dump_file() {
+  local id="${1:-}" path="${2:-}" out="${3:-}" a tmp
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  if [[ -z "$id" ]]; then
+    [[ -t 0 ]] || { warn "Usage: dump <snapshot> <path> [save-to]"; return 1; }
+    say "Snapshots"
+    restic snapshots --compact
+    id="$(ask_snapshot "Snapshot ID")"
+    read -e -r -p "Full path of the file inside the snapshot: " path
+    [[ -n "$path" ]] || return 0
+    read -r -p "[v]iew here or [s]ave to a file? [v/s] " a
+    if [[ "$a" =~ ^[Ss]$ ]]; then
+      read -e -r -p "Save as: " out
+    fi
+  fi
+  path="${path/#\~/$HOME}"
+
+  if [[ -n "$out" ]]; then
+    out="$(realpath -m "${out/#\~/$HOME}")"
+    [[ -e "$out" ]] && { warn "Refusing to overwrite existing file: $out"; return 1; }
+    restic dump "$id" "$path" > "$out" || { rm -f "$out"; return 1; }
+    ok "Saved to $out"
+  else
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' RETURN
+    restic dump "$id" "$path" > "$tmp" || return 1
+    if [[ ! -s "$tmp" ]]; then
+      warn "File is empty."
+    elif grep -qI . "$tmp"; then
+      page < "$tmp"
+    else
+      warn "Binary file; not shown. Choose 'save' instead."
+    fi
+  fi
+}
+
+# mount_repo [mountpoint]  - browse all snapshots as a read-only folder
+mount_repo() {
+  local mp="${1:-}" created=0
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  if ! command -v fusermount3 >/dev/null && ! command -v fusermount >/dev/null; then
+    warn "FUSE is not available (install fuse3)."
+    return 1
+  fi
+  if [[ -z "$mp" ]]; then
+    read -e -r -p "Mount point [$HOME/restic-mnt]: " mp
+    mp="${mp:-$HOME/restic-mnt}"
+  fi
+  mp="$(realpath -m "${mp/#\~/$HOME}")"
+  [[ -d "$mp" ]] || created=1
+  mkdir -p "$mp"
+  if [[ -n "$(ls -A "$mp")" ]]; then
+    warn "Mount point is not empty: $mp"; return 1
+  fi
+  say "Mounted read-only at $mp  (snapshots/, hosts/, tags/, ids/)"
+  echo "Open it in another terminal or your file manager. Press Ctrl-C here to unmount."
+  trap ':' INT                       # Ctrl-C stops restic, not this script
+  restic mount "$mp" || true
+  trap - INT
+  if (( created )); then rmdir "$mp" 2>/dev/null || true; fi
+}
+
+browse_menu() {
+  repo_exists || { warn "No repository found at $REPO"; return 1; }
+  local c
+  while true; do
+    cat <<'EOF'
+
+ Browse repository  (read-only, nothing is restored)
+
+  1) Summary: snapshots and sizes
+  2) List files in a snapshot
+  3) Search for a file across all snapshots
+  4) Compare two snapshots (what changed)
+  5) View or save one file from a snapshot
+  6) Mount as a read-only folder (FUSE)
+  b) Back
+EOF
+    read -r -p $'\n> ' c
+    case "$c" in
+      1) repo_summary || true; pause ;;
+      2) list_files || true; pause ;;
+      3) find_files || true; pause ;;
+      4) diff_snapshots || true; pause ;;
+      5) dump_file || true; pause ;;
+      6) mount_repo || true; pause ;;
+      b|B|q|Q|"") return 0 ;;
+      *) warn "Unknown option." ;;
+    esac
+  done
+}
+
+show_snapshots() { say "Snapshots"; restic snapshots; }
+
+run_check() { say "Checking repository integrity"; restic check; }
+
+settings() {
+  say "Settings"
+  echo "  Repository:    $REPO"
+  echo "  Password file: ${PASSWORD_FILE:-<none, restic will prompt>}"
+  echo "  Tag:           $TAG"
+  echo
+  local v
+  read -e -r -p "New repository path (empty to keep): " v
+  [[ -n "$v" ]] && REPO="$(realpath -m "${v/#\~/$HOME}")"
+  read -e -r -p "Password file path (empty to keep, '-' to clear): " v
+  if [[ "$v" == "-" ]]; then PASSWORD_FILE=""
+  elif [[ -n "$v" ]]; then PASSWORD_FILE="${v/#\~/$HOME}"; fi
+  echo "  Zip path:      ${ZIP_PATH:-<not set, asked on next backup>}"
+  read -e -r -p "Zip output path (empty to keep, '-' to disable): " v
+  if [[ "$v" == "-" ]]; then ZIP_PATH="-"
+  elif [[ -n "$v" ]]; then ZIP_PATH="$(realpath -m "${v/#\~/$HOME}")"; fi
+  read -r -p "Snapshot tag (empty to keep): " v
+  [[ -n "$v" ]] && TAG="$v"
+  save_config
+  apply_env
+  ok "Saved to $CONF_FILE"
+}
+
+menu() {
+  while true; do
+    clear
+    cat <<EOF
+ restic backup manager
+ repo: $REPO
+
+  1) List directories
+  2) Add directories
+  3) Remove a directory
+  4) Run backup now
+  5) Restore / extract from a snapshot
+  6) Initialize repository
+  7) Show snapshots
+  8) Check repository
+  9) Settings
+  b) Browse repository contents (no restore)
+  z) Create upload zip of the repo now
+  q) Quit
+EOF
+    read -r -p $'\n> ' choice
+    case "$choice" in
+      1) list_dirs; pause ;;
+      2) add_dirs ;;
+      3) remove_dirs; pause ;;
+      4) run_backup || true; pause ;;
+      5) restore_snapshot || true; pause ;;
+      6) init_repo || true; pause ;;
+      7) show_snapshots || true; pause ;;
+      8) run_check || true; pause ;;
+      9) settings; pause ;;
+      b|B) browse_menu || true ;;
+      z|Z) make_zip || true; pause ;;
+      q|Q) exit 0 ;;
+      *) warn "Unknown option." ; sleep 1 ;;
+    esac
+  done
+}
+
+# ---- entry point ------------------------------------------------------------
+ensure_repo
+
+case "${1:-menu}" in
+  menu)      menu ;;
+  list)      list_dirs ;;
+  add)       add_dirs ;;
+  remove)    remove_dirs ;;
+  init)      init_repo ;;
+  backup)    run_backup ;;
+  zip)       make_zip ;;
+  browse)    browse_menu ;;
+  summary)   repo_summary ;;
+  ls)        shift; list_files "$@" ;;
+  find)      shift; find_files "$@" ;;
+  diff)      shift; diff_snapshots "$@" ;;
+  dump)      shift; dump_file "$@" ;;
+  mount)     shift; mount_repo "$@" ;;
+  restore)   shift; restore_snapshot "$@" ;;
+  snapshots) show_snapshots ;;
+  check)     run_check ;;
+  *) echo "Usage: $0 [menu|list|add|remove|init|backup|restore|zip|browse|summary|ls|find|diff|dump|mount|snapshots|check]" >&2; exit 1 ;;
+esac
