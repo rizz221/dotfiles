@@ -1,0 +1,129 @@
+### Variables
+set $mod Mod4
+set $left h
+set $down j
+set $up k
+set $right l
+set $term foot 
+set $menu wmenu-run   # or: fuzzel, wofi --show drun, rofi -show drun
+
+### Appearance
+font pango:JetBrainsMono Nerd Font 10
+default_border pixel 2
+gaps inner 6
+gaps outer 2
+smart_borders on
+
+# Tokyo Night-ish colors    border   bg       text     indicator child_border
+client.focused              #7aa2f7  #7aa2f7  #1a1b26  #bb9af7   #7aa2f7
+client.unfocused            #414868  #1a1b26  #a9b1d6  #414868   #414868
+client.focused_inactive     #414868  #1a1b26  #a9b1d6  #414868   #414868
+client.urgent               #f7768e  #f7768e  #1a1b26  #f7768e   #f7768e
+
+output * bg #1a1b26 solid_color
+# output eDP-1 resolution 1920x1080 position 0,0 scale 1
+
+### Idle / lock (needs swayidle + swaylock)
+exec swayidle -w \
+    timeout 300 'swaylock -f -c 1a1b26' \
+    timeout 600 'swaymsg "output * power off"' \
+        resume 'swaymsg "output * power on"' \
+    before-sleep 'swaylock -f -c 1a1b26'
+
+### Input
+input type:keyboard {
+    xkb_layout us,ir
+    xkb_options grp:alt_shift_toggle,caps:escape
+    repeat_delay 250
+    repeat_rate 40
+}
+input type:touchpad {
+    tap enabled
+    natural_scroll enabled
+    dwt enabled
+}
+
+### Key bindings
+bindsym $mod+Return exec $term
+bindsym $mod+d exec $menu
+bindsym $mod+Shift+q kill
+bindsym $mod+Shift+c reload
+bindsym $mod+Shift+e exec swaynag -t warning -m 'Exit sway?' -B 'Yes' 'swaymsg exit'
+bindsym $mod+Ctrl+l exec swaylock -f -c 1a1b26
+floating_modifier $mod normal
+
+# Focus / move
+bindsym $mod+$left focus left
+bindsym $mod+$down focus down
+bindsym $mod+$up focus up
+bindsym $mod+$right focus right
+bindsym $mod+Shift+$left move left
+bindsym $mod+Shift+$down move down
+bindsym $mod+Shift+$up move up
+bindsym $mod+Shift+$right move right
+
+# Workspaces
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+3 workspace number 3
+bindsym $mod+4 workspace number 4
+bindsym $mod+5 workspace number 5
+bindsym $mod+Shift+1 move container to workspace number 1
+bindsym $mod+Shift+2 move container to workspace number 2
+bindsym $mod+Shift+3 move container to workspace number 3
+bindsym $mod+Shift+4 move container to workspace number 4
+bindsym $mod+Shift+5 move container to workspace number 5
+
+# Layout
+bindsym $mod+b splith
+bindsym $mod+v splitv
+bindsym $mod+s layout stacking
+bindsym $mod+w layout tabbed
+bindsym $mod+e layout toggle split
+bindsym $mod+f fullscreen
+bindsym $mod+Shift+space floating toggle
+bindsym $mod+space focus mode_toggle
+bindsym $mod+a focus parent
+
+# Scratchpad
+bindsym $mod+Shift+minus move scratchpad
+bindsym $mod+minus scratchpad show
+
+# Resize mode
+mode "resize" {
+    bindsym $left resize shrink width 10px
+    bindsym $down resize grow height 10px
+    bindsym $up resize shrink height 10px
+    bindsym $right resize grow width 10px
+    bindsym Return mode "default"
+    bindsym Escape mode "default"
+}
+bindsym $mod+r mode "resize"
+
+### Media / brightness (needs brightnessctl, wpctl from pipewire)
+bindsym --locked XF86AudioRaiseVolume exec wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+
+bindsym --locked XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
+bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+bindsym --locked XF86MonBrightnessUp exec brightnessctl set 5%+
+bindsym --locked XF86MonBrightnessDown exec brightnessctl set 5%-
+
+### Screenshots (needs grim + slurp + wl-clipboard)
+bindsym Print exec grim - | wl-copy
+bindsym $mod+Print exec grim -g "$(slurp)" - | wl-copy
+
+### Window rules
+for_window [app_id="pavucontrol"] floating enable
+for_window [app_id="org.keepassxc.KeePassXC"] floating enable
+for_window [window_role="pop-up"] floating enable
+
+### Bar
+bar {
+    swaybar_command waybar
+}
+
+### Autostart
+exec mako                                  # notifications
+exec nm-applet --indicator                 # optional
+exec dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP=sway
+exec kanshi
+include /etc/sway/config.d/*
